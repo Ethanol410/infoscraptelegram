@@ -122,19 +122,26 @@ def fetch_anthropic_rss() -> list[dict]:
         )
         resp.raise_for_status()
         content = resp.text
-        # Extract article titles and links from <a> tags containing /blog/ paths
-        matches = re.findall(
-            r'href="(/blog/([^"]+))"[^>]*>.*?<[^>]+>([^<]{10,})</[^>]+>',
-            content,
-            re.DOTALL,
-        )
-        seen = set()
-        for path, slug, title in matches:
-            title = re.sub(r"\s+", " ", title).strip()
-            url = f"https://www.anthropic.com{path}"
-            if slug in seen or not title:
-                continue
-            seen.add(slug)
+
+        # Step 1: collect unique /blog/<slug> URLs (excluding category pages)
+        slugs_seen: set[str] = set()
+        blog_urls: list[tuple[str, str]] = []  # (url, slug)
+        for slug in re.findall(r'href="(/blog/([^"#?/]+))"', content):
+            path, name = slug
+            if name and name not in slugs_seen:
+                slugs_seen.add(name)
+                blog_urls.append((f"https://www.anthropic.com{path}", name))
+
+        # Step 2: collect page headings (h1/h2/h3) as candidate titles
+        headings = [
+            re.sub(r"\s+", " ", h).strip()
+            for h in re.findall(r"<h[123][^>]*>([^<]{10,150})</h[123]>", content)
+            if h.strip()
+        ]
+
+        # Step 3: pair urls with headings positionally, fallback to formatted slug
+        for i, (url, slug) in enumerate(blog_urls[:15]):
+            title = headings[i] if i < len(headings) else slug.replace("-", " ").title()
             items.append({
                 "title": title,
                 "url": url,
@@ -144,7 +151,7 @@ def fetch_anthropic_rss() -> list[dict]:
                 "snippet": f"Article from Anthropic Blog: {title}"[:300],
                 "query_used": "Anthropic Blog scrape",
             })
-        log.info(f"Anthropic Blog scrape: {len(items)} items")
+        log.info(f"Anthropic Blog scrape: {len(items)} items ({len(headings)} headings found)")
     except Exception as e:
         log.warning(f"Anthropic Blog scrape failed: {e}")
 
@@ -494,8 +501,8 @@ def call_gemini(items: list[NewsItem], api_key: str) -> Optional[list[dict]]:
     ]
     prompt = (
         'Voici une liste d\'items de veille sur "Claude Code" d\'Anthropic.\n'
-        "Pour chaque item, réponds UNIQUEMENT en JSON :\n"
-        '{"items": [{"index": 0, "dominated": true/false, '
+        "Réponds UNIQUEMENT avec un objet JSON valide, sans markdown, sans balises code :\n"
+        '{"items": [{"index": 0, "dominated": false, '
         '"category": "official|tutorial|discussion|noise", "one_line_summary": "..."}]}\n\n'
         "Règles :\n"
         '- "noise" = pas spécifiquement lié à Claude Code d\'Anthropic, ou contenu recyclé/vague\n'
@@ -509,15 +516,33 @@ def call_gemini(items: list[NewsItem], api_key: str) -> Optional[list[dict]]:
             headers={"X-goog-api-key": api_key, "Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
             },
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        log.info(f"Gemini raw response (first 300 chars): {text[:300]!r}")
+
+        # Strip markdown code fences if present (```json ... ``` or ``` ... ```)
+        text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text.strip())
+
+        # Extract the JSON object
         match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group()).get("items", [])
+        if not match:
+            log.warning(f"Gemini: no JSON object found in response: {text[:200]!r}")
+            return None
+
+        parsed = json.loads(match.group())
+        result = parsed.get("items", [])
+        log.info(f"Gemini parsed: {len(result)} items classified")
+        return result
+
+    except json.JSONDecodeError as e:
+        log.warning(f"Gemini: JSON parse error: {e}")
+    except KeyError as e:
+        log.warning(f"Gemini: unexpected response structure, missing key {e}")
     except Exception as e:
         log.warning(f"Gemini API failed: {e}")
     return None
@@ -530,7 +555,7 @@ def summarize(items: list[NewsItem], llm_api_key: Optional[str]) -> list[NewsIte
     if llm_api_key and items:
         log.info(f"Calling Gemini Flash for {min(len(items), MAX_ITEMS_FOR_LLM)} items")
         llm_results = call_gemini(items, llm_api_key)
-        if llm_results:
+        if llm_results is not None:
             llm_map = {r["index"]: r for r in llm_results}
             filtered = []
             for i, item in enumerate(items[:MAX_ITEMS_FOR_LLM]):
