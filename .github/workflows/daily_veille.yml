@@ -1,0 +1,32 @@
+name: Veille Claude Code
+
+on:
+  schedule:
+    # 07:00 UTC = 08:00 Paris (heure d'été CEST) / 09:00 Paris (heure d'hiver CET)
+    # Ajuster à 06:00 UTC en hiver si vous voulez 07:00 Paris
+    - cron: "0 7 * * *"
+  workflow_dispatch: # Déclenchement manuel depuis l'onglet Actions
+
+jobs:
+  veille:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run veille bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: python main.py
