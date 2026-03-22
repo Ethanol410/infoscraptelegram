@@ -5,6 +5,8 @@ Pipeline: collect → normalize → deduplicate → score_and_filter → summari
 """
 
 import argparse
+import concurrent.futures
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -226,20 +229,51 @@ def fetch_hackernews(query: str) -> list[dict]:
     return items
 
 
-def fetch_reddit(query: str) -> list[dict]:
-    """Fetch recent Reddit posts. Tries www then old.reddit.com (GitHub Actions IPs are often blocked)."""
+def get_reddit_token(client_id: str, client_secret: str) -> Optional[str]:
+    """Obtain a Reddit OAuth2 bearer token via client_credentials grant."""
+    try:
+        resp = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            data={"grant_type": "client_credentials"},
+            auth=(client_id, client_secret),
+            headers={"User-Agent": "python:claude-code-veille:v2.0"},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        token = resp.json().get("access_token")
+        if token:
+            log.info("Reddit OAuth token obtained successfully")
+        return token
+    except Exception as e:
+        log.warning(f"Reddit OAuth token request failed: {e}")
+        return None
+
+
+def fetch_reddit(query: str, bearer_token: Optional[str] = None) -> list[dict]:
+    """Fetch recent Reddit posts. Uses OAuth if token provided, else falls back to public API."""
     items = []
     params = {"q": query, "sort": "new", "t": "day", "limit": 25}
-    # Reddit blocks most datacenter IPs; a realistic browser UA improves success rate.
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-    }
 
-    for base in ["https://www.reddit.com/search.json", "https://old.reddit.com/search.json"]:
+    if bearer_token:
+        # OAuth path — authenticated, no IP block
+        bases = ["https://oauth.reddit.com/search"]
+        headers = {
+            "Authorization": f"Bearer {bearer_token}",
+            "User-Agent": "python:claude-code-veille:v2.0",
+            "Accept": "application/json",
+        }
+    else:
+        # Fallback — unauthenticated (likely blocked from GitHub Actions)
+        bases = ["https://www.reddit.com/search.json", "https://old.reddit.com/search.json"]
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        }
+
+    for base in bases:
         try:
             resp = requests.get(base, params=params, timeout=TIMEOUT, headers=headers)
             resp.raise_for_status()
@@ -271,6 +305,9 @@ def fetch_reddit(query: str) -> list[dict]:
             log.warning(f"Reddit fetch failed ({base}) for '{query}': {e}")
 
     return items
+
+
+
 
 
 def fetch_google_news(query: str) -> list[dict]:
@@ -306,6 +343,41 @@ def fetch_google_news(query: str) -> list[dict]:
     return items
 
 
+def fetch_github_releases() -> list[dict]:
+    """Fetch releases from the anthropics/claude-code GitHub repository."""
+    url = "https://api.github.com/repos/anthropics/claude-code/releases"
+    items = []
+    try:
+        resp = requests.get(
+            url,
+            params={"per_page": 10},
+            timeout=TIMEOUT,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "ClaudeCodeVeille/2.0"},
+        )
+        resp.raise_for_status()
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+        for release in resp.json():
+            published_at = release.get("published_at", "")
+            dt = parse_date(published_at)
+            if dt and dt < cutoff:
+                continue  # plus vieux que 48h
+            title = release.get("name") or release.get("tag_name", "")
+            body = re.sub(r"<[^>]+>", "", release.get("body", ""))[:300]
+            items.append({
+                "title": f"Claude Code Release: {title}",
+                "url": release.get("html_url", ""),
+                "source_name": "GitHub Releases",
+                "source_type": "official",
+                "published_at": published_at,
+                "snippet": body or f"New release: {title}",
+                "query_used": "GitHub Releases API",
+            })
+        log.info(f"GitHub Releases: {len(items)} items")
+    except Exception as e:
+        log.warning(f"GitHub Releases fetch failed: {e}")
+    return items
+
+
 def collect() -> tuple[list[dict], int]:
     """Collect raw items from all sources. Returns (items, sources_count)."""
     log.info("=== collect() ===")
@@ -313,13 +385,19 @@ def collect() -> tuple[list[dict], int]:
     sources_count = 0
 
     # Priority 1 — Official
-    for fetcher in [fetch_anthropic_rss, fetch_anthropic_changelog]:
+    for fetcher in [fetch_anthropic_rss, fetch_anthropic_changelog, fetch_github_releases]:
         result = fetcher()
         if result:
             sources_count += 1
         all_items.extend(result)
 
     # Priority 2 — Community (one source counter per service, not per query)
+    reddit_client_id = os.environ.get("REDDIT_CLIENT_ID")
+    reddit_client_secret = os.environ.get("REDDIT_CLIENT_SECRET")
+    reddit_token = None
+    if reddit_client_id and reddit_client_secret:
+        reddit_token = get_reddit_token(reddit_client_id, reddit_client_secret)
+
     hn_contributed = False
     reddit_contributed = False
     for query in SEARCH_QUERIES:
@@ -329,7 +407,7 @@ def collect() -> tuple[list[dict], int]:
             hn_contributed = True
         all_items.extend(hn_items)
 
-        reddit_items = fetch_reddit(query)
+        reddit_items = fetch_reddit(query, bearer_token=reddit_token)
         if reddit_items and not reddit_contributed:
             sources_count += 1
             reddit_contributed = True
@@ -372,6 +450,48 @@ def parse_date(date_str: Optional[str]) -> Optional[datetime]:
     return None
 
 
+def resolve_url(url: str) -> str:
+    """Follow redirects to get the final URL (HEAD with GET fallback)."""
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=5)
+        final = resp.url
+        # If HEAD didn't redirect at all, try GET (some servers ignore HEAD)
+        if final == url:
+            resp = requests.get(url, allow_redirects=True, timeout=5, stream=True)
+            resp.close()
+            final = resp.url
+        return final
+    except Exception:
+        return url
+
+
+def resolve_google_news_urls(items: list[NewsItem]) -> list[NewsItem]:
+    """Resolve Google News redirect URLs to their final destinations in parallel."""
+    to_resolve = [
+        (i, item) for i, item in enumerate(items)
+        if item.source_name == "Google News" and "news.google.com" in item.url
+    ][:30]  # max 30 pour limiter la latence
+
+    if not to_resolve:
+        return items
+
+    log.info(f"Resolving {len(to_resolve)} Google News URLs...")
+    result = list(items)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_idx = {executor.submit(resolve_url, item.url): i for i, item in to_resolve}
+        for future in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result[idx].url = future.result()
+            except Exception:
+                pass  # conserver l'URL d'origine
+
+    resolved = sum(1 for i, item in to_resolve if result[i].url != item.url)
+    log.info(f"Google News URLs resolved: {resolved}/{len(to_resolve)}")
+    return result
+
+
 def normalize(raw_items: list[dict]) -> list[NewsItem]:
     """Convert raw dicts to normalized NewsItem objects."""
     log.info("=== normalize() ===")
@@ -399,19 +519,30 @@ def normalize(raw_items: list[dict]) -> list[NewsItem]:
 
 # ─── Deduplicate ──────────────────────────────────────────────────────────────
 
-def deduplicate(items: list[NewsItem]) -> list[NewsItem]:
-    """Remove duplicates by exact URL and similar titles (SequenceMatcher ≥ 0.85)."""
+def deduplicate(
+    items: list[NewsItem], seen_cache: Optional[dict[str, str]] = None
+) -> list[NewsItem]:
+    """Remove duplicates by exact URL, similar titles, and inter-run cache."""
     log.info("=== deduplicate() ===")
     seen_urls: set[str] = set()
     seen_titles: list[str] = []
     result: list[NewsItem] = []
+    cache_hits = 0
 
     for item in items:
         norm_url = item.url.rstrip("/").lower()
+
+        # Inter-run cache check
+        if seen_cache and hash_url(norm_url) in seen_cache:
+            cache_hits += 1
+            continue
+
+        # Exact URL dedup
         if norm_url in seen_urls:
             continue
         seen_urls.add(norm_url)
 
+        # Fuzzy title dedup
         title_lower = item.title.lower()
         if any(
             SequenceMatcher(None, title_lower, t).ratio() >= 0.85
@@ -422,6 +553,8 @@ def deduplicate(items: list[NewsItem]) -> list[NewsItem]:
         seen_titles.append(title_lower)
         result.append(item)
 
+    if cache_hits:
+        log.info(f"Cache: skipped {cache_hits} already-seen items from previous runs")
     log.info(f"After dedup: {len(result)} items (removed {len(items) - len(result)})")
     return result
 
@@ -687,6 +820,53 @@ def send_telegram(
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+# ─── Cache inter-runs (GitHub Gist) ──────────────────────────────────────────
+
+def hash_url(url: str) -> str:
+    """Return a 16-char hex hash of a normalized URL."""
+    return hashlib.sha256(url.lower().rstrip("/").encode()).hexdigest()[:16]
+
+
+def load_cache(gist_id: str, token: str) -> dict[str, str]:
+    """Load the seen-URLs cache from a private GitHub Gist. Returns {} on failure."""
+    try:
+        resp = requests.get(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        content = resp.json()["files"]["cache.json"]["content"]
+        data = json.loads(content).get("seen", {})
+
+        # TTL: purge entries older than 7 days
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        pruned = {h: ts for h, ts in data.items() if ts >= cutoff}
+        if len(pruned) < len(data):
+            log.info(f"Cache: pruned {len(data) - len(pruned)} expired entries")
+        log.info(f"Cache loaded: {len(pruned)} URLs already seen")
+        return pruned
+    except Exception as e:
+        log.warning(f"Cache load failed (continuing without cache): {e}")
+        return {}
+
+
+def save_cache(gist_id: str, token: str, seen: dict[str, str]) -> None:
+    """Save the updated seen-URLs cache back to the Gist."""
+    try:
+        payload = {"files": {"cache.json": {"content": json.dumps({"seen": seen}, indent=2)}}}
+        resp = requests.patch(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+            json=payload,
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        log.info(f"Cache saved: {len(seen)} URLs total")
+    except Exception as e:
+        log.warning(f"Cache save failed: {e}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Bot de veille Claude Code")
     parser.add_argument(
@@ -696,9 +876,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Évol 4 — Skip si le cron de 6h UTC fire en hiver (déjà 7h UTC = 8h Paris)
+    is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    if not is_manual and not args.dry_run:
+        paris_now = datetime.now(ZoneInfo("Europe/Paris"))
+        if paris_now.hour != 8:
+            log.info(f"Paris time is {paris_now.hour}h (not 8h) — skipping this cron fire.")
+            sys.exit(0)
+
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     llm_api_key = os.environ.get("LLM_API_KEY")
+    cache_gist_id = os.environ.get("CACHE_GIST_ID")
+    cache_github_token = os.environ.get("CACHE_GITHUB_TOKEN")
 
     if not args.dry_run:
         missing = [v for v, k in [("TELEGRAM_BOT_TOKEN", bot_token), ("TELEGRAM_CHAT_ID", chat_id)] if not k]
@@ -711,16 +901,32 @@ def main() -> None:
 
     log.info("Starting Claude Code veille pipeline")
 
+    # Load inter-run cache
+    seen_cache: dict[str, str] = {}
+    if cache_gist_id and cache_github_token:
+        seen_cache = load_cache(cache_gist_id, cache_github_token)
+    else:
+        log.info("Cache disabled (CACHE_GIST_ID or CACHE_GITHUB_TOKEN not set)")
+
     raw_items, sources_count = collect()
     total_collected = len(raw_items)
 
     normalized = normalize(raw_items)
-    deduped = deduplicate(normalized)
+    normalized = resolve_google_news_urls(normalized)
+    deduped = deduplicate(normalized, seen_cache=seen_cache)
     scored = score_and_filter(deduped)
     final_items = summarize(scored, llm_api_key)
 
     message = format_message(final_items, total_collected, sources_count)
     send_telegram(message, bot_token, chat_id, dry_run=args.dry_run)
+
+    # Update inter-run cache with newly sent URLs
+    if cache_gist_id and cache_github_token and final_items:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for item in final_items:
+            seen_cache[hash_url(item.url.rstrip("/").lower())] = now_iso
+        if not args.dry_run:
+            save_cache(cache_gist_id, cache_github_token, seen_cache)
 
     log.info("Pipeline completed successfully")
 
