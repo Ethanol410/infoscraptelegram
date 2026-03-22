@@ -123,14 +123,17 @@ def fetch_anthropic_rss() -> list[dict]:
         resp.raise_for_status()
         content = resp.text
 
-        # Step 1: collect unique /blog/<slug> URLs (excluding category pages)
+        # Step 1: collect unique /blog/<slug> URLs — handle relative & absolute, single & double quotes
         slugs_seen: set[str] = set()
         blog_urls: list[tuple[str, str]] = []  # (url, slug)
-        for slug in re.findall(r'href="(/blog/([^"#?/]+))"', content):
-            path, name = slug
+        for path in re.findall(
+            r'''href=["'](?:https://www\.anthropic\.com)?(/blog/([a-z0-9][a-z0-9-]{2,}))["']''',
+            content,
+        ):
+            full_path, name = path
             if name and name not in slugs_seen:
                 slugs_seen.add(name)
-                blog_urls.append((f"https://www.anthropic.com{path}", name))
+                blog_urls.append((f"https://www.anthropic.com{full_path}", name))
 
         # Step 2: collect page headings (h1/h2/h3) as candidate titles
         headings = [
@@ -516,7 +519,7 @@ def call_gemini(items: list[NewsItem], api_key: str) -> Optional[list[dict]]:
             headers={"X-goog-api-key": api_key, "Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
             },
             timeout=TIMEOUT,
         )
@@ -524,27 +527,60 @@ def call_gemini(items: list[NewsItem], api_key: str) -> Optional[list[dict]]:
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
         log.info(f"Gemini raw response (first 300 chars): {text[:300]!r}")
 
-        # Strip markdown code fences if present (```json ... ``` or ``` ... ```)
+        # Strip markdown code fences if present
         text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text.strip())
 
-        # Extract the JSON object
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            log.warning(f"Gemini: no JSON object found in response: {text[:200]!r}")
+        parsed = _try_parse_gemini_json(text)
+        if parsed is None:
+            log.warning(f"Gemini: could not extract valid JSON from response")
             return None
 
-        parsed = json.loads(match.group())
         result = parsed.get("items", [])
         log.info(f"Gemini parsed: {len(result)} items classified")
         return result
 
-    except json.JSONDecodeError as e:
-        log.warning(f"Gemini: JSON parse error: {e}")
     except KeyError as e:
         log.warning(f"Gemini: unexpected response structure, missing key {e}")
     except Exception as e:
         log.warning(f"Gemini API failed: {e}")
+    return None
+
+
+def _try_parse_gemini_json(text: str) -> Optional[dict]:
+    """Try multiple strategies to extract a valid JSON object from Gemini's response."""
+    # Strategy 1: parse the whole text directly
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: find the outermost {...} block and parse it
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: the JSON is truncated — recover complete items only
+    # Find all well-formed item objects before the truncation point
+    items = re.findall(
+        r'\{"index"\s*:\s*\d+\s*,\s*"dominated"\s*:\s*(?:true|false)\s*,'
+        r'\s*"category"\s*:\s*"[^"]*"\s*,\s*"one_line_summary"\s*:\s*"[^"]*"\s*\}',
+        text,
+    )
+    if items:
+        log.info(f"Gemini: recovered {len(items)} complete items from truncated JSON")
+        recovered = []
+        for item_str in items:
+            try:
+                recovered.append(json.loads(item_str))
+            except json.JSONDecodeError:
+                continue
+        if recovered:
+            return {"items": recovered}
+
     return None
 
 
