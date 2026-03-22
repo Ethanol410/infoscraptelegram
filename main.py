@@ -56,7 +56,7 @@ MAX_ITEMS_FOR_LLM = 15
 MAX_ITEMS_IN_MESSAGE = 5
 
 GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 )
 
 
@@ -79,30 +79,75 @@ class NewsItem:
 # ─── Collect ──────────────────────────────────────────────────────────────────
 
 def fetch_anthropic_rss() -> list[dict]:
-    """Fetch Anthropic blog RSS feed."""
-    url = "https://www.anthropic.com/rss.xml"
+    """Fetch Anthropic blog — tries RSS feed first, scrapes blog page as fallback."""
     items = []
+
+    # Try known RSS URLs
+    for rss_url in [
+        "https://www.anthropic.com/blog.rss",
+        "https://www.anthropic.com/feed.xml",
+        "https://www.anthropic.com/rss",
+    ]:
+        try:
+            resp = requests.get(rss_url, timeout=TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            root = ET.fromstring(resp.text)
+            for item in root.findall(".//item"):
+                title = item.findtext("title", "").strip()
+                link = item.findtext("link", "").strip()
+                pub_date = item.findtext("pubDate", "").strip()
+                description = re.sub(r"<[^>]+>", "", item.findtext("description", ""))[:300]
+                items.append({
+                    "title": title,
+                    "url": link,
+                    "source_name": "Anthropic Blog",
+                    "source_type": "official",
+                    "published_at": pub_date,
+                    "snippet": description.strip(),
+                    "query_used": "Anthropic Blog RSS",
+                })
+            if items:
+                log.info(f"Anthropic RSS ({rss_url}): {len(items)} items")
+                return items
+        except Exception:
+            continue
+
+    # Fallback: scrape the blog page
+    log.info("Anthropic RSS not found — scraping blog page")
     try:
-        resp = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(
+            "https://www.anthropic.com/blog",
+            timeout=TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
         resp.raise_for_status()
-        root = ET.fromstring(resp.text)
-        for item in root.findall(".//item"):
-            title = item.findtext("title", "").strip()
-            link = item.findtext("link", "").strip()
-            pub_date = item.findtext("pubDate", "").strip()
-            description = re.sub(r"<[^>]+>", "", item.findtext("description", ""))[:300]
+        content = resp.text
+        # Extract article titles and links from <a> tags containing /blog/ paths
+        matches = re.findall(
+            r'href="(/blog/([^"]+))"[^>]*>.*?<[^>]+>([^<]{10,})</[^>]+>',
+            content,
+            re.DOTALL,
+        )
+        seen = set()
+        for path, slug, title in matches:
+            title = re.sub(r"\s+", " ", title).strip()
+            url = f"https://www.anthropic.com{path}"
+            if slug in seen or not title:
+                continue
+            seen.add(slug)
             items.append({
                 "title": title,
-                "url": link,
+                "url": url,
                 "source_name": "Anthropic Blog",
                 "source_type": "official",
-                "published_at": pub_date,
-                "snippet": description.strip(),
-                "query_used": "Anthropic Blog RSS",
+                "published_at": None,
+                "snippet": f"Article from Anthropic Blog: {title}"[:300],
+                "query_used": "Anthropic Blog scrape",
             })
-        log.info(f"Anthropic RSS: {len(items)} items")
+        log.info(f"Anthropic Blog scrape: {len(items)} items")
     except Exception as e:
-        log.warning(f"Anthropic RSS failed: {e}")
+        log.warning(f"Anthropic Blog scrape failed: {e}")
+
     return items
 
 
@@ -172,39 +217,49 @@ def fetch_hackernews(query: str) -> list[dict]:
 
 
 def fetch_reddit(query: str) -> list[dict]:
-    """Fetch recent Reddit posts via public JSON API."""
-    url = "https://www.reddit.com/search.json"
+    """Fetch recent Reddit posts. Tries www then old.reddit.com (GitHub Actions IPs are often blocked)."""
     items = []
-    try:
-        params = {"q": query, "sort": "new", "t": "day", "limit": 25}
-        headers = {"User-Agent": "ClaudeCodeVeille/1.0"}
-        resp = requests.get(url, params=params, timeout=TIMEOUT, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        for post in data.get("data", {}).get("children", []):
-            p = post.get("data", {})
-            title = p.get("title", "").strip()
-            permalink = f"https://reddit.com{p.get('permalink', '')}"
-            selftext = p.get("selftext", "")[:200]
-            created_utc = p.get("created_utc")
-            pub_date = (
-                datetime.fromtimestamp(created_utc, tz=timezone.utc).isoformat()
-                if created_utc
-                else None
-            )
-            subreddit = p.get("subreddit_name_prefixed", "")
-            items.append({
-                "title": title,
-                "url": permalink,
-                "source_name": "Reddit",
-                "source_type": "community",
-                "published_at": pub_date,
-                "snippet": f"{subreddit} — {selftext or title}"[:300],
-                "query_used": query,
-            })
-        log.info(f"Reddit '{query}': {len(items)} items")
-    except Exception as e:
-        log.warning(f"Reddit fetch failed for '{query}': {e}")
+    params = {"q": query, "sort": "new", "t": "day", "limit": 25}
+    # Reddit blocks most datacenter IPs; a realistic browser UA improves success rate.
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+    }
+
+    for base in ["https://www.reddit.com/search.json", "https://old.reddit.com/search.json"]:
+        try:
+            resp = requests.get(base, params=params, timeout=TIMEOUT, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            for post in data.get("data", {}).get("children", []):
+                p = post.get("data", {})
+                title = p.get("title", "").strip()
+                permalink = f"https://reddit.com{p.get('permalink', '')}"
+                selftext = p.get("selftext", "")[:200]
+                created_utc = p.get("created_utc")
+                pub_date = (
+                    datetime.fromtimestamp(created_utc, tz=timezone.utc).isoformat()
+                    if created_utc
+                    else None
+                )
+                subreddit = p.get("subreddit_name_prefixed", "")
+                items.append({
+                    "title": title,
+                    "url": permalink,
+                    "source_name": "Reddit",
+                    "source_type": "community",
+                    "published_at": pub_date,
+                    "snippet": f"{subreddit} — {selftext or title}"[:300],
+                    "query_used": query,
+                })
+            log.info(f"Reddit '{query}': {len(items)} items")
+            return items
+        except Exception as e:
+            log.warning(f"Reddit fetch failed ({base}) for '{query}': {e}")
+
     return items
 
 
