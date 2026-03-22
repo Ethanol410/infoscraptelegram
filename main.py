@@ -56,7 +56,7 @@ MAX_ITEMS_FOR_LLM = 15
 MAX_ITEMS_IN_MESSAGE = 5
 
 GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
 )
 
 
@@ -505,7 +505,8 @@ def call_gemini(items: list[NewsItem], api_key: str) -> Optional[list[dict]]:
     )
     try:
         resp = requests.post(
-            f"{GEMINI_API_URL}?key={api_key}",
+            GEMINI_API_URL,
+            headers={"X-goog-api-key": api_key, "Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
