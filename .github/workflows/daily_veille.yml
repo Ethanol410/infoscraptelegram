@@ -32,4 +32,5 @@ jobs:
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           CACHE_GIST_ID: ${{ secrets.CACHE_GIST_ID }}
           CACHE_GITHUB_TOKEN: ${{ secrets.CACHE_GITHUB_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python main.py
