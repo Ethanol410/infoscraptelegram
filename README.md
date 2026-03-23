@@ -1,6 +1,6 @@
 # Bot Telegram — Veille Claude Code
 
-Bot qui envoie chaque matin un résumé des nouveautés sur **Claude Code** d'Anthropic, directement dans Telegram. Fonctionne entièrement sur GitHub Actions (0 €/mois).
+Bot qui envoie chaque matin à **8h00 heure de Paris** un résumé des nouveautés sur **Claude Code** d'Anthropic, directement dans Telegram. Fonctionne entièrement sur GitHub Actions (0 €/mois).
 
 ## Arborescence
 
@@ -8,35 +8,38 @@ Bot qui envoie chaque matin un résumé des nouveautés sur **Claude Code** d'An
 .
 ├── main.py                          # Script principal (pipeline complet)
 ├── requirements.txt                 # Dépendances Python (requests uniquement)
+├── SETUP_V2.md                      # Guide de configuration des fonctionnalités V2
 ├── .github/
 │   └── workflows/
-│       └── daily_veille.yml         # Workflow GitHub Actions (cron 8h Paris)
+│       └── daily_veille.yml         # Workflow GitHub Actions (cron 8h Paris, adaptatif DST)
 └── README.md
 ```
 
 ## Pipeline
 
 ```
-collect() → normalize() → deduplicate() → score_and_filter() → summarize() → send_telegram()
+collect() → normalize() → resolve_google_news_urls() → deduplicate() → score_and_filter() → summarize() → send_telegram()
 ```
 
 | Étape | Rôle |
 |---|---|
 | `collect` | Récupère les items bruts depuis 5 sources |
 | `normalize` | Convertit tout en `NewsItem` avec dates ISO 8601 |
-| `deduplicate` | Supprime les doublons (URL exacte + titre similaire ≥ 85%) |
+| `resolve_google_news_urls` | Résout les redirections Google News vers les URLs finales |
+| `deduplicate` | Supprime les doublons (URL exacte + titre similaire ≥ 85% + cache inter-runs) |
 | `score_and_filter` | Filtre les hors-sujet, attribue un score 0–100 |
 | `summarize` | Appel Gemini Flash optionnel pour éliminer le bruit |
 | `send_telegram` | Envoie le message formaté |
 
 **Sources collectées :**
-- Blog Anthropic (RSS)
+- Anthropic Blog (RSS avec fallback scraping)
 - Anthropic Changelog (scraping léger)
+- **GitHub Releases** `anthropics/claude-code` (nouveau — API publique)
 - Hacker News (API Algolia)
-- Reddit (JSON public)
-- Google News (RSS)
+- Reddit (JSON public — OAuth si configuré, voir `SETUP_V2.md`)
+- Google News (RSS + résolution des URLs)
 
-**LLM utilisé :** Gemini 1.5 Flash — free tier (jusqu'à ~1 500 req/jour), suffisant pour 1 appel/jour. Si l'API est indisponible, le bot envoie quand même un résumé basé sur le scoring Python.
+**LLM utilisé :** Gemini Flash — free tier (jusqu'à ~1 500 req/jour), suffisant pour 1 appel/jour. Si l'API est indisponible, le bot envoie quand même un résumé basé sur le scoring Python.
 
 ---
 
@@ -77,15 +80,28 @@ collect() → normalize() → deduplicate() → score_and_filter() → summarize
 
 Dans votre repo GitHub : **Settings → Secrets and variables → Actions → New repository secret**
 
+**Secrets requis :**
+
 | Secret | Valeur |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Token obtenu via BotFather |
 | `TELEGRAM_CHAT_ID` | Votre Chat ID Telegram |
 | `LLM_API_KEY` | Clé API Gemini (optionnel) |
 
+**Secrets optionnels V2 :**
+
+| Secret | Valeur | Fonctionnalité |
+|---|---|---|
+| `CACHE_GIST_ID` | ID de votre Gist privé | Cache inter-runs (évite les rediffusions) |
+| `CACHE_GITHUB_TOKEN` | PAT GitHub (scope `gist`) | Cache inter-runs |
+| `REDDIT_CLIENT_ID` | Client ID app Reddit | Reddit OAuth (évite les blocages 403) |
+| `REDDIT_CLIENT_SECRET` | Client Secret app Reddit | Reddit OAuth |
+
+> Voir `SETUP_V2.md` pour le guide de configuration des secrets optionnels.
+
 ### 5. Activer GitHub Actions
 
-Pousser le code sur votre repo. Le workflow se déclenchera automatiquement à **7h00 UTC (8h Paris en été)**.
+Pousser le code sur votre repo. Le workflow se déclenchera automatiquement à **8h00 heure de Paris**, été comme hiver (double cron adaptatif).
 
 ---
 
@@ -112,31 +128,30 @@ Le message formaté s'affiche dans les logs à la fin.
 
 Dans GitHub : onglet **Actions → Veille Claude Code → Run workflow**
 
-Utile pour tester sans attendre le cron du lendemain.
+Les déclenchements manuels contournent le check d'heure Paris (toujours exécutés).
 
 ---
 
-## Limites connues du MVP
+## Limites connues
 
-| Limite | Impact | Contournement |
+| Limite | Impact | Statut |
 |---|---|---|
-| **Pas de mémoire inter-runs** | Un article peut être signalé plusieurs jours de suite | Acceptable pour le MVP ; V2 : cache Redis ou fichier de state |
-| **Scraping Changelog fragile** | Si Anthropic change son HTML, les entrées ne seront plus extraites | Surveiller le log ; V2 : utiliser le vrai RSS s'il existe |
-| **Timezone fixe à l'heure d'été** | En hiver, le cron envoie à 8h UTC = 9h Paris | Ajuster le cron manuellement en octobre/mars |
-| **Gemini Flash** | Le free tier peut être restreint selon la région ou la politique Google | Fallback automatique sur scoring Python |
-| **Reddit rate-limiting** | Reddit bloque parfois les robots non authentifiés | Le bot continue sans Reddit ; V2 : OAuth app Reddit |
-| **Google News URLs** | Les URLs sont des redirections Google, pas les URLs finales | Acceptable pour le MVP |
+| **Scraping Changelog fragile** | Si Anthropic change son HTML, les entrées disparaissent | En cours — surveiller les logs |
+| **Blog Anthropic (SPA)** | Le site charge les articles en JS, le scraping retourne 0 items | Limitation structurelle ; GitHub Releases compense |
+| **Reddit bloqué depuis GitHub Actions** | IPs datacenter bloquées sans OAuth | Configurable via `SETUP_V2.md` (Reddit OAuth) |
+| **Gemini Flash** | Free tier peut être restreint selon la région | Fallback automatique sur scoring Python |
+| **Cache sans Gist configuré** | Articles peuvent être re-signalés le lendemain | Configurable via `SETUP_V2.md` (Cache Gist) |
 
 ---
 
-## Évolutions V2 (classées par impact/effort)
+## Fonctionnalités V2 implémentées
 
-| # | Amélioration | Impact | Effort |
+| # | Fonctionnalité | Statut | Configuration |
 |---|---|---|---|
-| 1 | **Cache inter-runs** (fichier JSON dans une GitHub Release ou gist) | Élimine les rediffusions | Moyen |
-| 2 | **Source GitHub** (releases/tags `anthropics/claude-code`) | Alertes officielles instantanées | Faible |
-| 3 | **Résolution des URLs Google News** | Liens directs dans le message | Faible |
-| 4 | **Cron adaptatif heure d'été/hiver** | Heure d'envoi précise toute l'année | Faible |
-| 5 | **Reddit OAuth** | Évite les blocages, accès aux scores | Moyen |
-| 6 | **Résumé LLM enrichi** (synthèse narrative plutôt que liste) | Message plus lisible | Moyen |
-| 7 | **Multi-canal** (Discord, Slack, email) | Touche plus de bénéficiaires | Élevé |
+| 1 | **Cache inter-runs** (Gist privé, TTL 7 jours) | Prêt | `SETUP_V2.md` → étape 6 |
+| 2 | **Source GitHub Releases** (`anthropics/claude-code`) | Actif | Automatique |
+| 3 | **Résolution URLs Google News** (parallèle, 10 workers) | Actif | Automatique |
+| 4 | **Cron adaptatif heure d'été/hiver** (double cron + check Paris) | Actif | Automatique |
+| 5 | **Reddit OAuth** (client_credentials, sans compte utilisateur) | Prêt | `SETUP_V2.md` → étape 5 |
+| 6 | **Résumé LLM enrichi** (synthèse narrative) | À venir | — |
+| 7 | **Multi-canal** (Discord, Slack, email) | À venir | — |

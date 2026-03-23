@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-TIMEOUT = 15  # seconds
+TIMEOUT = 15        # seconds — HTTP fetches
+TIMEOUT_LLM = 30    # seconds — LLM inference (Gemini can be slow)
 
 SEARCH_QUERIES = [
     "Claude Code",
@@ -178,9 +180,11 @@ def fetch_anthropic_changelog() -> list[dict]:
             heading = heading.strip()
             if not heading:
                 continue
+            slug = re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
+            entry_url = f"{url}#{slug}" if slug else url
             items.append({
                 "title": f"Anthropic Changelog: {heading}",
-                "url": url,
+                "url": entry_url,
                 "source_name": "Anthropic Changelog",
                 "source_type": "official",
                 "published_at": None,
@@ -250,55 +254,67 @@ def get_reddit_token(client_id: str, client_secret: str) -> Optional[str]:
 
 
 def fetch_reddit(query: str, bearer_token: Optional[str] = None) -> list[dict]:
-    """Fetch recent Reddit posts. Uses OAuth if token provided, else falls back to public API."""
+    """Fetch recent Reddit posts. Tries OAuth first, then falls back to public endpoints."""
     items = []
     params = {"q": query, "sort": "new", "t": "day", "limit": 25}
 
-    if bearer_token:
-        # OAuth path — authenticated, no IP block
-        bases = ["https://oauth.reddit.com/search"]
-        headers = {
-            "Authorization": f"Bearer {bearer_token}",
-            "User-Agent": "python:claude-code-veille:v2.0",
-            "Accept": "application/json",
-        }
-    else:
-        # Fallback — unauthenticated (likely blocked from GitHub Actions)
-        bases = ["https://www.reddit.com/search.json", "https://old.reddit.com/search.json"]
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-        }
+    def _parse_posts(data: dict) -> list[dict]:
+        result = []
+        for post in data.get("data", {}).get("children", []):
+            p = post.get("data", {})
+            title = p.get("title", "").strip()
+            permalink = f"https://reddit.com{p.get('permalink', '')}"
+            selftext = p.get("selftext", "")[:200]
+            created_utc = p.get("created_utc")
+            pub_date = (
+                datetime.fromtimestamp(created_utc, tz=timezone.utc).isoformat()
+                if created_utc else None
+            )
+            subreddit = p.get("subreddit_name_prefixed", "")
+            result.append({
+                "title": title,
+                "url": permalink,
+                "source_name": "Reddit",
+                "source_type": "community",
+                "published_at": pub_date,
+                "snippet": f"{subreddit} — {selftext or title}"[:300],
+                "query_used": query,
+            })
+        return result
 
-    for base in bases:
+    # Try OAuth path first
+    if bearer_token:
         try:
-            resp = requests.get(base, params=params, timeout=TIMEOUT, headers=headers)
+            resp = requests.get(
+                "https://oauth.reddit.com/search",
+                params=params,
+                timeout=TIMEOUT,
+                headers={
+                    "Authorization": f"Bearer {bearer_token}",
+                    "User-Agent": "python:claude-code-veille:v2.0",
+                    "Accept": "application/json",
+                },
+            )
             resp.raise_for_status()
-            data = resp.json()
-            for post in data.get("data", {}).get("children", []):
-                p = post.get("data", {})
-                title = p.get("title", "").strip()
-                permalink = f"https://reddit.com{p.get('permalink', '')}"
-                selftext = p.get("selftext", "")[:200]
-                created_utc = p.get("created_utc")
-                pub_date = (
-                    datetime.fromtimestamp(created_utc, tz=timezone.utc).isoformat()
-                    if created_utc
-                    else None
-                )
-                subreddit = p.get("subreddit_name_prefixed", "")
-                items.append({
-                    "title": title,
-                    "url": permalink,
-                    "source_name": "Reddit",
-                    "source_type": "community",
-                    "published_at": pub_date,
-                    "snippet": f"{subreddit} — {selftext or title}"[:300],
-                    "query_used": query,
-                })
+            items = _parse_posts(resp.json())
+            log.info(f"Reddit '{query}': {len(items)} items")
+            return items
+        except Exception as e:
+            log.warning(f"Reddit OAuth failed for '{query}': {e} — falling back to public API")
+
+    # Public API fallback (also used when no token)
+    public_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+    }
+    for base in ["https://www.reddit.com/search.json", "https://old.reddit.com/search.json"]:
+        try:
+            resp = requests.get(base, params=params, timeout=TIMEOUT, headers=public_headers)
+            resp.raise_for_status()
+            items = _parse_posts(resp.json())
             log.info(f"Reddit '{query}': {len(items)} items")
             return items
         except Exception as e:
@@ -379,48 +395,64 @@ def fetch_github_releases() -> list[dict]:
 
 
 def collect() -> tuple[list[dict], int]:
-    """Collect raw items from all sources. Returns (items, sources_count)."""
+    """Collect raw items from all sources in parallel. Returns (items, sources_count)."""
     log.info("=== collect() ===")
-    all_items: list[dict] = []
-    sources_count = 0
 
-    # Priority 1 — Official
-    for fetcher in [fetch_anthropic_rss, fetch_anthropic_changelog, fetch_github_releases]:
-        result = fetcher()
-        if result:
-            sources_count += 1
-        all_items.extend(result)
-
-    # Priority 2 — Community (one source counter per service, not per query)
+    # Get Reddit token upfront (blocking, needed before parallel Reddit fetches)
     reddit_client_id = os.environ.get("REDDIT_CLIENT_ID")
     reddit_client_secret = os.environ.get("REDDIT_CLIENT_SECRET")
     reddit_token = None
     if reddit_client_id and reddit_client_secret:
         reddit_token = get_reddit_token(reddit_client_id, reddit_client_secret)
 
-    hn_contributed = False
-    reddit_contributed = False
+    # Build all tasks: (service_key, callable, args)
+    tasks: list[tuple[str, object, list]] = [
+        ("anthropic_rss",       fetch_anthropic_rss,       []),
+        ("anthropic_changelog",  fetch_anthropic_changelog,  []),
+        ("github_releases",      fetch_github_releases,      []),
+    ]
     for query in SEARCH_QUERIES:
-        hn_items = fetch_hackernews(query)
-        if hn_items and not hn_contributed:
-            sources_count += 1
-            hn_contributed = True
-        all_items.extend(hn_items)
-
-        reddit_items = fetch_reddit(query, bearer_token=reddit_token)
-        if reddit_items and not reddit_contributed:
-            sources_count += 1
-            reddit_contributed = True
-        all_items.extend(reddit_items)
-
-    # Priority 3 — Aggregator (first two queries to avoid hammering)
-    gn_contributed = False
+        tasks.append((f"hn_{query}",     fetch_hackernews, [query]))
+        tasks.append((f"reddit_{query}", fetch_reddit,     [query, reddit_token]))
     for query in SEARCH_QUERIES[:2]:
-        gn_items = fetch_google_news(query)
-        if gn_items and not gn_contributed:
+        tasks.append((f"gn_{query}", fetch_google_news, [query]))
+
+    # Run all fetches in parallel
+    fetch_results: dict[str, list[dict]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_key = {
+            executor.submit(fn, *args): key  # type: ignore[arg-type]
+            for key, fn, args in tasks
+        }
+        for future in concurrent.futures.as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                fetch_results[key] = future.result()
+            except Exception as e:
+                log.warning(f"Fetch failed ({key}): {e}")
+                fetch_results[key] = []
+
+    # Aggregate results and count active sources (by service, not by query)
+    all_items: list[dict] = []
+    sources_count = 0
+    hn_counted = reddit_counted = gn_counted = False
+
+    for key, _fn, _args in tasks:
+        items = fetch_results.get(key, [])
+        all_items.extend(items)
+        if not items:
+            continue
+        if key in ("anthropic_rss", "anthropic_changelog", "github_releases"):
             sources_count += 1
-            gn_contributed = True
-        all_items.extend(gn_items)
+        elif key.startswith("hn_") and not hn_counted:
+            hn_counted = True
+            sources_count += 1
+        elif key.startswith("reddit_") and not reddit_counted:
+            reddit_counted = True
+            sources_count += 1
+        elif key.startswith("gn_") and not gn_counted:
+            gn_counted = True
+            sources_count += 1
 
     log.info(f"Total collected: {len(all_items)} items from {sources_count} sources")
     return all_items, sources_count
@@ -477,6 +509,8 @@ def resolve_google_news_urls(items: list[NewsItem]) -> list[NewsItem]:
 
     log.info(f"Resolving {len(to_resolve)} Google News URLs...")
     result = list(items)
+    # Save original URLs before mutation (shallow copy means same objects)
+    original_urls = {i: item.url for i, item in to_resolve}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_idx = {executor.submit(resolve_url, item.url): i for i, item in to_resolve}
@@ -487,7 +521,7 @@ def resolve_google_news_urls(items: list[NewsItem]) -> list[NewsItem]:
             except Exception:
                 pass  # conserver l'URL d'origine
 
-    resolved = sum(1 for i, item in to_resolve if result[i].url != item.url)
+    resolved = sum(1 for i in original_urls if result[i].url != original_urls[i])
     log.info(f"Google News URLs resolved: {resolved}/{len(to_resolve)}")
     return result
 
@@ -530,7 +564,10 @@ def deduplicate(
     cache_hits = 0
 
     for item in items:
-        norm_url = item.url.rstrip("/").lower()
+        # Normalize: lowercase, strip slash, remove UTM params, normalize http/https
+        norm_url = re.sub(r"[?&](utm_[^&]*|ref=[^&]*|source=[^&]*)(&|$)", "", item.url.lower().rstrip("/")).rstrip("?&")
+        norm_url = re.sub(r"^http://", "https://", norm_url)
+        norm_url = re.sub(r"^https?://www\.", "https://", norm_url)
 
         # Inter-run cache check
         if seen_cache and hash_url(norm_url) in seen_cache:
@@ -568,8 +605,12 @@ def is_relevant(item: NewsItem) -> bool:
 
     # Relevance gate — official sources pass directly
     if item.source_type != "official":
-        has_term = any(term in title_lower for term in RELEVANCE_TERMS)
-        has_anthropic_code = "anthropic" in title_lower and "code" in title_lower
+        has_term = any(term in title_lower or term in snippet_lower for term in RELEVANCE_TERMS)
+        has_anthropic_code = (
+            "anthropic" in title_lower and "code" in title_lower
+        ) or (
+            "anthropic" in snippet_lower and "code" in snippet_lower
+        )
         if not (has_term or has_anthropic_code):
             return False
 
@@ -654,7 +695,7 @@ def call_gemini(items: list[NewsItem], api_key: str) -> Optional[list[dict]]:
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
             },
-            timeout=TIMEOUT,
+            timeout=TIMEOUT_LLM,
         )
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -747,55 +788,86 @@ def summarize(items: list[NewsItem], llm_api_key: Optional[str]) -> list[NewsIte
 
 # ─── Format and Send ──────────────────────────────────────────────────────────
 
-def format_message(items: list[NewsItem], total_collected: int, sources_count: int) -> str:
-    """Build the Telegram-formatted message."""
-    today = datetime.now().strftime("%d %B %Y")
+def escape_markdown(text: str) -> str:
+    """Escape Telegram legacy Markdown special characters in user-provided text."""
+    return re.sub(r"([*_`\[\]])", r"\\\1", text)
 
-    if not items:
-        return "☕ Rien de neuf sur Claude Code aujourd'hui. Bonne journée !"
 
-    lines = [f"📡 *Veille Claude Code — {today}*\n"]
-
+def _build_sections(items: list[NewsItem], bold_open: str, bold_close: str) -> list[str]:
+    """Build message section lines with the given bold markers."""
+    lines = []
     official = [i for i in items if i.source_type == "official"]
     community = [i for i in items if i.source_type == "community"]
     aggregator = [i for i in items if i.source_type == "aggregator"]
 
     if official:
-        lines.append("🚨 *Officiel*")
+        lines.append(f"🚨 {bold_open}Officiel{bold_close}")
         for item in official:
-            summary = item.one_line_summary or item.title
+            summary = escape_markdown(item.one_line_summary or item.title)
             lines.append(f"• {summary}")
             lines.append(f"  → {item.url}")
 
     if community:
-        lines.append("\n💬 *Communauté*")
+        lines.append(f"\n💬 {bold_open}Communauté{bold_close}")
         for item in community:
-            summary = item.one_line_summary or item.title
+            summary = escape_markdown(item.one_line_summary or item.title)
             lines.append(f"• {summary}")
             lines.append(f"  → {item.url}")
 
     if aggregator:
-        lines.append("\n📰 *Actualités*")
+        lines.append(f"\n📰 {bold_open}Actualités{bold_close}")
         for item in aggregator:
-            summary = item.one_line_summary or item.title
+            summary = escape_markdown(item.one_line_summary or item.title)
             lines.append(f"• {summary}")
             lines.append(f"  → {item.url}")
 
+    return lines
+
+
+def format_message(items: list[NewsItem], total_collected: int, sources_count: int) -> str:
+    """Build the Telegram-formatted message."""
+    today = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d %B %Y")
+
+    if not items:
+        return "☕ Rien de neuf sur Claude Code aujourd'hui. Bonne journée !"
+
+    lines = [f"📡 *Veille Claude Code — {today}*\n"]
+    lines.extend(_build_sections(items, "*", "*"))
     lines.append(
         f"\n📊 {sources_count} sources analysées · "
         f"{total_collected} items collectés · {len(items)} retenus"
     )
 
     message = "\n".join(lines)
-    if len(message) > 1500:
-        message = message[:1497] + "..."
+    if len(message) > 3500:  # Telegram supports 4096; leave headroom
+        message = message[:3497] + "..."
+    return message
+
+
+def format_discord_message(items: list[NewsItem], total_collected: int, sources_count: int) -> str:
+    """Build the Discord-formatted message (uses ** bold, 2000 char limit)."""
+    today = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d %B %Y")
+
+    if not items:
+        return "☕ Rien de neuf sur Claude Code aujourd'hui. Bonne journée !"
+
+    lines = [f"📡 **Veille Claude Code — {today}**\n"]
+    lines.extend(_build_sections(items, "**", "**"))
+    lines.append(
+        f"\n📊 {sources_count} sources analysées · "
+        f"{total_collected} items collectés · {len(items)} retenus"
+    )
+
+    message = "\n".join(lines)
+    if len(message) > 1900:  # Discord limit is 2000
+        message = message[:1897] + "..."
     return message
 
 
 def send_telegram(
     message: str, bot_token: str, chat_id: str, dry_run: bool = False
 ) -> None:
-    """Send message via Telegram Bot API. Exits with code 1 on failure."""
+    """Send message via Telegram Bot API. Raises RuntimeError on failure."""
     if dry_run:
         log.info("=== DRY RUN — Message Telegram ===\n%s\n=== END DRY RUN ===", message)
         return
@@ -814,25 +886,21 @@ def send_telegram(
         resp.raise_for_status()
         log.info("Telegram message sent successfully")
     except Exception as e:
-        log.error(f"Failed to send Telegram message: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Telegram send failed: {e}") from e
 
 
 def send_discord(
     message: str, webhook_url: str, dry_run: bool = False
 ) -> None:
-    """Send message via Discord Webhook. Skips silently on failure (non-blocking)."""
-    # Convert Telegram Markdown (*bold*) to Discord Markdown (**bold**)
-    discord_msg = message.replace("*", "**")
-
+    """Send message via Discord Webhook. Non-blocking on failure."""
     if dry_run:
-        log.info("=== DRY RUN — Message Discord ===\n%s\n=== END DRY RUN ===", discord_msg)
+        log.info("=== DRY RUN — Message Discord ===\n%s\n=== END DRY RUN ===", message)
         return
 
     try:
         resp = requests.post(
             webhook_url,
-            json={"content": discord_msg},
+            json={"content": message},
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
@@ -890,6 +958,15 @@ def save_cache(gist_id: str, token: str, seen: dict[str, str]) -> None:
         log.warning(f"Cache save failed: {e}")
 
 
+def normalize_url(url: str) -> str:
+    """Normalize URL for dedup: lowercase, strip trailing slash, remove UTM params."""
+    url = url.lower().rstrip("/")
+    # Strip common tracking parameters
+    url = re.sub(r"[?&](utm_[^&]*|ref=[^&]*|source=[^&]*)(&|$)", "", url)
+    url = url.rstrip("?&")
+    return url
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Bot de veille Claude Code")
     parser.add_argument(
@@ -899,7 +976,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Évol 4 — Skip si le cron de 6h UTC fire en hiver (déjà 7h UTC = 8h Paris)
+    # Skip si le cron de 6h UTC fire en hiver (déjà 7h UTC = 8h Paris)
     is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     if not is_manual and not args.dry_run:
         paris_now = datetime.now(ZoneInfo("Europe/Paris"))
@@ -915,7 +992,7 @@ def main() -> None:
     discord_webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
     if not args.dry_run:
-        missing = [v for v, k in [("TELEGRAM_BOT_TOKEN", bot_token), ("TELEGRAM_CHAT_ID", chat_id)] if not k]
+        missing = [name for name, val in [("TELEGRAM_BOT_TOKEN", bot_token), ("TELEGRAM_CHAT_ID", chat_id)] if not val]
         if missing:
             log.error(f"Missing required environment variables: {', '.join(missing)}")
             sys.exit(1)
@@ -923,6 +1000,7 @@ def main() -> None:
     if not llm_api_key:
         log.warning("LLM_API_KEY not set — LLM filtering disabled")
 
+    pipeline_start = time.time()
     log.info("Starting Claude Code veille pipeline")
 
     # Load inter-run cache
@@ -941,20 +1019,34 @@ def main() -> None:
     scored = score_and_filter(deduped)
     final_items = summarize(scored, llm_api_key)
 
-    message = format_message(final_items, total_collected, sources_count)
-    send_telegram(message, bot_token, chat_id, dry_run=args.dry_run)
-    if discord_webhook_url:
-        send_discord(message, discord_webhook_url, dry_run=args.dry_run)
+    # Send to all configured channels
+    telegram_message = format_message(final_items, total_collected, sources_count)
+    telegram_ok = True
+    try:
+        send_telegram(telegram_message, bot_token, chat_id, dry_run=args.dry_run)
+    except RuntimeError as e:
+        log.error(str(e))
+        telegram_ok = False
 
-    # Update inter-run cache with newly sent URLs
-    if cache_gist_id and cache_github_token and final_items:
+    if discord_webhook_url:
+        discord_message = format_discord_message(final_items, total_collected, sources_count)
+        send_discord(discord_message, discord_webhook_url, dry_run=args.dry_run)
+
+    # Update inter-run cache: cache ALL scored items (not just the top 5 sent)
+    # This avoids re-processing rejected items on the next run
+    items_to_cache = scored  # includes items filtered by LLM
+    if cache_gist_id and cache_github_token and items_to_cache:
         now_iso = datetime.now(timezone.utc).isoformat()
-        for item in final_items:
-            seen_cache[hash_url(item.url.rstrip("/").lower())] = now_iso
+        for item in items_to_cache:
+            seen_cache[hash_url(normalize_url(item.url))] = now_iso
         if not args.dry_run:
             save_cache(cache_gist_id, cache_github_token, seen_cache)
 
-    log.info("Pipeline completed successfully")
+    elapsed = time.time() - pipeline_start
+    log.info(f"Pipeline completed in {elapsed:.1f}s")
+
+    if not telegram_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+.vscode/
+.idea/
+logs.md
+CLAUDE.md
+*.log
+settings.local.json
