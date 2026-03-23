@@ -818,6 +818,29 @@ def send_telegram(
         sys.exit(1)
 
 
+def send_discord(
+    message: str, webhook_url: str, dry_run: bool = False
+) -> None:
+    """Send message via Discord Webhook. Skips silently on failure (non-blocking)."""
+    # Convert Telegram Markdown (*bold*) to Discord Markdown (**bold**)
+    discord_msg = message.replace("*", "**")
+
+    if dry_run:
+        log.info("=== DRY RUN — Message Discord ===\n%s\n=== END DRY RUN ===", discord_msg)
+        return
+
+    try:
+        resp = requests.post(
+            webhook_url,
+            json={"content": discord_msg},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        log.info("Discord message sent successfully")
+    except Exception as e:
+        log.error(f"Failed to send Discord message: {e}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 # ─── Cache inter-runs (GitHub Gist) ──────────────────────────────────────────
@@ -889,6 +912,7 @@ def main() -> None:
     llm_api_key = os.environ.get("LLM_API_KEY")
     cache_gist_id = os.environ.get("CACHE_GIST_ID")
     cache_github_token = os.environ.get("CACHE_GITHUB_TOKEN")
+    discord_webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
     if not args.dry_run:
         missing = [v for v, k in [("TELEGRAM_BOT_TOKEN", bot_token), ("TELEGRAM_CHAT_ID", chat_id)] if not k]
@@ -919,6 +943,8 @@ def main() -> None:
 
     message = format_message(final_items, total_collected, sources_count)
     send_telegram(message, bot_token, chat_id, dry_run=args.dry_run)
+    if discord_webhook_url:
+        send_discord(message, discord_webhook_url, dry_run=args.dry_run)
 
     # Update inter-run cache with newly sent URLs
     if cache_gist_id and cache_github_token and final_items:
