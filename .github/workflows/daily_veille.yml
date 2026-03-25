@@ -15,19 +15,35 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Guard — only run at 8h Paris (handles DST)
+        id: time_guard
+        run: |
+          hour=$(TZ='Europe/Paris' date +%-H)
+          echo "Paris hour: $hour"
+          if [ "$hour" -ne 8 ]; then
+            echo "Not 8h Paris (current: ${hour}h) — skipping run."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.time_guard.outputs.skip != 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python 3.12
+        if: steps.time_guard.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
       - name: Install dependencies
+        if: steps.time_guard.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
       - name: Run veille bot
+        if: steps.time_guard.outputs.skip != 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -40,7 +56,7 @@ jobs:
         run: python main.py
 
       - name: Notify on failure
-        if: failure()
+        if: failure() && steps.time_guard.outputs.skip != 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
