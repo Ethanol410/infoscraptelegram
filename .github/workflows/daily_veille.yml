@@ -2,8 +2,7 @@ name: Veille Claude Code
 
 on:
   schedule:
-    - cron: "0 6 * * *"  # 8h Paris en été (CEST = UTC+2)
-    - cron: "0 7 * * *"  # 8h Paris en hiver (CET = UTC+1)
+    - cron: "0 6 * * *"  # ~8h Paris (CEST=UTC+2) ou ~7h Paris (CET=UTC+1)
   workflow_dispatch: # Déclenchement manuel depuis l'onglet Actions
 
 permissions:
@@ -15,15 +14,16 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Guard — only run at 8h Paris (handles DST)
+      - name: Guard — skip if run too late (GitHub delay protection)
         id: time_guard
         run: |
           hour=$(TZ='Europe/Paris' date +%-H)
           echo "Paris hour: $hour"
-          if [ "$hour" -ne 8 ]; then
-            echo "Not 8h Paris (current: ${hour}h) — skipping run."
+          if [ "$hour" -gt 11 ]; then
+            echo "Too late (current: ${hour}h Paris) — skipping run."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            echo "Running at ${hour}h Paris."
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
