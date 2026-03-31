@@ -1339,6 +1339,15 @@ def send_telegram(
             },
             timeout=TIMEOUT,
         )
+        if resp.status_code == 400:
+            # Markdown parse error (e.g. _ in URLs) — retry as plain text
+            log.warning("Telegram Markdown parse error, retrying as plain text")
+            plain = re.sub(r"[*_`]", "", message)
+            resp = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": plain, "disable_web_page_preview": True},
+                timeout=TIMEOUT,
+            )
         resp.raise_for_status()
         log.info("Telegram message sent successfully")
     except Exception as e:
