@@ -691,7 +691,7 @@ def fetch_github_trending() -> list[dict]:
             for repo in page.css("article.Box-row"):
                 name_el = repo.css("h2 a, h1 a")
                 name = name_el.css("::text").get(default="").strip().replace("\n", "").replace(" ", "")
-                href = name_el.attrib.get("href", "")
+                href = name_el.css("::attr(href)").get(default="")
                 description = repo.css("p::text").get(default="").strip()
                 stars_text = repo.css("span[id*='repo-stars-counter'], .octicon-star + span::text").get(default="0").strip().replace(",", "")
                 combined = (name + " " + description).lower()
