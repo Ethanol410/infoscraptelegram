@@ -1433,8 +1433,8 @@ def main() -> None:
     is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     if not is_manual and not args.dry_run:
         paris_now = datetime.now(ZoneInfo("Europe/Paris"))
-        if paris_now.hour != 8:
-            log.info(f"Paris time is {paris_now.hour}h (not 8h) — skipping this cron fire.")
+        if not (7 <= paris_now.hour <= 10):
+            log.info(f"Paris time is {paris_now.hour}h (outside 7–10h window) — skipping this cron fire.")
             sys.exit(0)
 
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
