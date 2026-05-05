@@ -7,5 +7,7 @@ __pycache__/
 .idea/
 logs.md
 CLAUDE.md
+prompt_bot_veille_claude_code_v2.md
+tasks/
 *.log
 settings.local.json
